@@ -8,99 +8,88 @@
 
 set -e
 
-if [ "$(id -u)" -ne "0" ]; then
-	exec fakeroot $0 $@
+if [ $EUID -ne 0 ]; then
+	exec fakeroot $0 "$@"
 fi
 
-BUSYBOX="../busybox"
+unset BIN_FILES VERBOSE BUILD_DIR INIT
+declare -a BIN_FILES
 
-TEMP=$(mktemp -d)
-TEMPFILE=$(mktemp)
+cleanup() {
+	if [ -n "$BUILD_DIR" -a -d "$BUILD_DIR" ]; then
+		rm -rf "$BUILD_DIR"
+	fi
+}
 
-mkdir -p $TEMP/bin
-cp -va $BUSYBOX/busybox $TEMP/bin
+trap cleanup EXIT
 
-cd $TEMP
-mkdir dev proc sys tmp sbin
+fail() {
+	echo "ERROR: $1" >&2
+	exit 1
+}
+
+while [ $# -ne 0 ]; do
+	arg="$1"
+	case "$arg" in
+		-i|--init)
+			shift
+			arg="$1"
+
+			[ -z "$INIT" ] || fail "-i/--init can only be specificed once"
+
+			[ -f "$arg" ] || fail "Argument to -b/--bin is not a file: $arg"
+			[ -x "$arg" ] || fail "Argument to -b/--bin is not executable: $arg"
+
+			INIT="$arg"
+		;;
+		-b|--bin)
+			shift
+			arg="$1"
+
+			[ -f "$arg" ] || fail "Argument to -b/--bin is not a file: $arg"
+			[ -x "$arg" ] || fail "Argument to -b/--bin is not executable: $arg"
+
+			BIN_FILES+=("$arg")
+		;;
+		-v|--verbose)
+			[ -z "$VERBOSE" ] || fail "-v/--verbose can only be specified once"
+
+			VERBOSE=1
+		;;
+		*)
+			fail "Unrecognized option: $arg"
+		;;
+	esac
+
+	shift
+done
+
+if [ -z "$INIT" ]; then
+	fail "init executable or script must be specified with required parameter -i/--init"
+fi
+
+BUILD_DIR=$(mktemp -d)
+
+pushd "$BUILD_DIR" >/dev/null
+mkdir -p bin dev proc sys tmp sbin
 mknod dev/console c 5 1
-cat > $TEMP/init <<'EOF'
-#!/bin/busybox sh
+popd >/dev/null
 
-# Install busybox
-/bin/busybox --install -s
+cp "$INIT" "$BUILD_DIR/init"
 
-# Mount the /proc and /sys filesystems.
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev
+if [ ${#BIN_FILES[@]} -gt 0 ]; then
+	if [ -n "$VERBOSE" ]; then echo "Files placed in /bin:"; fi
 
-cmdline() {
-        local value
-        value=" $(cat /proc/cmdline) "
-        value="${value##* $1=}"
-        value="${value%% *}"
-        [ "$value" != "" ] && echo "$value"
-}
+	for file in "${BIN_FILES[@]}"; do
+		cp "$file" "$BUILD_DIR/bin/" || fail "Failed to copy file $file into /bin"
+		if [ -n "$VERBOSE" ]; then echo "  $file"; fi
+	done
+fi
 
-realboot() {
-        echo "Rootfs: $1";
-        # Mount real root.
-        mkdir -p /mnt/root
-        mount -o rw "$1" /mnt/root
+OUTPUT=$(readlink -f initrd.gz)
 
-        if [ -x /mnt/root/sbin/init -o -h /mnt/root/sbin/init ]; then
-                # Cleanup.
-                umount /proc
-                umount /sys
-                umount /dev
-
-                # Boot the real system.
-                exec switch_root /mnt/root /sbin/init
-        else
-                umount /mnt/root
-        fi
-}
-
-runshell() {
-        echo "Dropping to a shell."
-        echo
-        setsid cttyhack /bin/sh
-}
-
-find_parition_by_value() {
-        echo `blkid | tr -d '"' | grep "$1" | cut -d ':' -f 1 | head -n 1`
-}
-
-boot() {
-        echo "Kernel params: `cat /proc/cmdline`"
-        local i=5
-        local kernel_root_param=$(cmdline root)
-
-        while [ "$i" -ge 1 ]; do
-                echo "Waiting for root system $kernel_root_param, countdown : $i";
-                local root=`find_parition_by_value $kernel_root_param`
-                if [ -e "$root" ]; then
-                        realboot $root;
-                fi;
-
-                i=$(( $i - 1 ));
-                sleep 5;
-        done;
-
-        # Default rootfs - sd partition 2
-        realboot /dev/mmcblk0p2;
-        runshell;
-}
-boot;
-EOF
-chmod 755 $TEMP/init
-
-find . | cpio -H newc -o > $TEMPFILE
-
-cd -
-
-cat $TEMPFILE | gzip >initrd.gz
-
-rm $TEMPFILE
-rm -rf $TEMP
+pushd "$BUILD_DIR" >/dev/null
+find . | cpio -o -H newc -D "$BUILD_DIR" 2>/dev/null | gzip >"$OUTPUT"
+popd >/dev/null
 sync
+
